@@ -17,15 +17,15 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 
 # --- Инициализация ИИ-модели высокого качества ---
-# При старте сервера rembg проверит модель в кэше Mac. Если её нет, он сам скачает её.
 # "isnet-general-use" — выдает шикарное качество и работает быстро.
-# (Альтернатива для теста супер-качества: "birefnet-general", но она весит больше)
 ai_session = new_session("isnet-general-use")
 
 
+# 🔥 Двойной декоратор: теперь бэкенд поймет оба варианта пути от Framer
 @router.post("/remove-bg")
+@router.post("/remove-background")
 async def remove_background(
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # Строго совпадает с именем "file" во Framer
     x_session_id: str | None = Header(default=None),  # для гостей
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_current_user),
