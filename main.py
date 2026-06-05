@@ -14,10 +14,10 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="g-Remover API", version="1.0.0")
 
-# CORS — разрешаем запросы с Framer сайта
+# CORS — разрешаем запросы с Framer сайта и любых других внешних источников
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене замени на свой домен Framer
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,7 +26,12 @@ app.add_middleware(
 # Импортируем роуты
 from routes import remove_bg, users
 app.include_router(users.router, prefix="/api/users", tags=["users"])
+
+# 🔥 БРОНЕБОЙНОЕ РЕШЕНИЕ ДЛЯ FRAMER:
+# Подключаем роутер удаления фона дважды: и с префиксом /api, и БЕЗ него.
+# Теперь сервер поймет и адрес /api/remove-background, и прямой адрес /remove-background
 app.include_router(remove_bg.router, prefix="/api", tags=["remove-bg"])
+app.include_router(remove_bg.router, tags=["remove-bg"])
 
 @app.get("/")
 def root():
