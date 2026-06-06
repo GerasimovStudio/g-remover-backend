@@ -9,17 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from PIL import Image
 
-# Імпортуємо підключення до бази та моделі з кореню проекту
+# Импортируем подключение к базе и модели из корня твоего проекта
 from database import engine, Base, SessionLocal
 import models
 import replicate
 
-# Ініціалізуємо таблиці в Supabase при старті додатка
+# Инициализируем таблицы в Supabase при старте приложения
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="gServices AI Engine", version="1.4.0")
+app = FastAPI(title="gServices AI Engine Premium", version="1.5.0")
 
-# Налаштування CORS — відкриваємо доступ для Framer Preview та продакшну
+# Настройка CORS — открываем доступ для Framer Preview и продакшна
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Залежність сесії бази даних
+# Зависимость сессии базы данных
 def get_db():
     db = SessionLocal()
     try:
@@ -36,7 +36,7 @@ def get_db():
     finally:
         db.close()
 
-# --- ДОПОМІЖНІ ФУНКЦІЇ ОБРОБКИ ЗОБРАЖЕНЬ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ ИЗОБРАЖЕНИЙ ---
 
 def apply_background_color(image_bytes: bytes, hex_color: str) -> bytes:
     try:
@@ -64,7 +64,7 @@ def apply_custom_background(foreground_bytes: bytes, background_bytes: bytes) ->
 def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[str]) -> tuple[str, any]:
     today = datetime.date.today()
 
-    # Якщо email передано, перевіряємо його в базі даних
+    # Если email передано, проверяем его в базе данных Supabase
     if auth_email:
         user = db.query(models.User).filter(models.User.email == auth_email, models.User.is_active == True).first()
         if user:
@@ -78,72 +78,10 @@ def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[st
                     raise HTTPException(status_code=429, detail="LIMIT_EXCEEDED: Лимит тарифа Starter исчерпан.")
             return user.plan, user
         
-        # 🔥 РОЗУМНИЙ ФОЛБЕК: Якщо email не знайдено в базі (наприклад, при тестах во Framer),
-        # ми БІЛЬШЕ НЕ ВИДАЄМО 404, а просто спускаємо користувача на безпечні ліміти гостя!
+        # Если юзер не найден (например, тестовый во Framer), мягко спускаем на лимиты гостя без ошибки 404
 
-    # Логіка для гостя (анонімна сесія за IP)
+    # Логика для гостя (анонимная сессия по IP)
     guest = db.query(models.GuestSession).filter(models.GuestSession.session_id == client_ip).first()
     if not guest:
         guest = models.GuestSession(session_id=client_ip, usage_count=0)
-        db.add(guest)
-        db.commit()
-        db.refresh(guest)
-
-    if guest.created_at and guest.created_at.date() != today:
-        guest.usage_count = 0
-        guest.created_at = datetime.datetime.now()
-        db.commit()
-
-    if guest.usage_count >= 5:
-        raise HTTPException(status_code=429, detail="LIMIT_EXCEEDED: Дневной лимит гостя исчерпан.")
-
-    return "anonymous", guest
-
-# --- ЕНДПОЇНТИ ДЛЯ ФРОНТЕНДУ ---
-
-@app.post("/api/remove-bg")
-@app.post("/api/remove-bg/")
-async def remove_background(
-    request: Request,
-    file: UploadFile = File(...),
-    background_color: Optional[str] = Form(None),
-    background_file: UploadFile = File(None),
-    x_user_email: Optional[str] = Header(None),
-    email: Optional[str] = Form(None),
-    db: Session = Depends(get_db)
-):
-    client_ip = request.client.host
-    final_email = x_user_email or email
-    plan, db_record = check_and_update_limits(db, client_ip, final_email)
-
-    try:
-        file_bytes = await file.read()
-        try:
-            model = replicate.models.get("briaai/rmbg-1.5")
-            target_version = model.versions.list()[0]
-        except Exception:
-            model = replicate.models.get("cjwbw/rembg")
-            target_version = model.versions.list()[0]
-
-        output = replicate.run(target_version, input={"image": io.BytesIO(file_bytes)})
-        img_data = requests.get(output).content
-        
-        if background_file and background_file.filename:
-            bg_bytes = await background_file.read()
-            img_data = apply_custom_background(img_data, bg_bytes)
-            media_type = "image/jpeg"
-        elif background_color:
-            img_data = apply_background_color(img_data, background_color)
-            media_type = "image/jpeg"
-        else:
-            media_type = "image/png"
-
-        db_record.usage_count += 1
-        db.commit()
-        return Response(content=img_data, media_type=media_type)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка ИИ: {str(e)}")
-
-@app.get("/")
-def root():
-    return {"status": "online", "service": "gServices-AI-Engine-Fixed"}
+        db.add
