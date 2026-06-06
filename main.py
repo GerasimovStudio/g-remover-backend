@@ -9,17 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from PIL import Image
 
-# Импортируем подключение к базе и модели из корня твоего проекта
+# Імпортуємо підключення до бази та моделі з кореню проекту
 from database import engine, Base, SessionLocal
 import models
 import replicate
 
-# Инициализируем таблицы в Supabase при старте приложения
+# Ініціалізуємо таблиці в Supabase при старті додатка
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="gServices AI Engine", version="1.3.0")
+app = FastAPI(title="gServices AI Engine", version="1.4.0")
 
-# Настройка CORS — открываем доступ для Framer Preview и продакшна
+# Налаштування CORS — відкриваємо доступ для Framer Preview та продакшну
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Зависимость сессии базы данных
+# Залежність сесії бази даних
 def get_db():
     db = SessionLocal()
     try:
@@ -36,7 +36,7 @@ def get_db():
     finally:
         db.close()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ОБРАБОТКИ ИЗОБРАЖЕНИЙ ---
+# --- ДОПОМІЖНІ ФУНКЦІЇ ОБРОБКИ ЗОБРАЖЕНЬ ---
 
 def apply_background_color(image_bytes: bytes, hex_color: str) -> bytes:
     try:
@@ -64,21 +64,24 @@ def apply_custom_background(foreground_bytes: bytes, background_bytes: bytes) ->
 def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[str]) -> tuple[str, any]:
     today = datetime.date.today()
 
+    # Якщо email передано, перевіряємо його в базі даних
     if auth_email:
         user = db.query(models.User).filter(models.User.email == auth_email, models.User.is_active == True).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="Пользователь gServices не найден")
+        if user:
+            if user.plan == "starter":
+                if user.usage_reset and (datetime.datetime.now() - user.usage_reset).days >= 30:
+                    user.usage_count = 0
+                    user.usage_reset = datetime.datetime.now()
+                    db.commit()
+
+                if user.usage_count >= 30:
+                    raise HTTPException(status_code=429, detail="LIMIT_EXCEEDED: Лимит тарифа Starter исчерпан.")
+            return user.plan, user
         
-        if user.plan == "starter":
-            if user.usage_reset and (datetime.datetime.now() - user.usage_reset).days >= 30:
-                user.usage_count = 0
-                user.usage_reset = datetime.datetime.now()
-                db.commit()
+        # 🔥 РОЗУМНИЙ ФОЛБЕК: Якщо email не знайдено в базі (наприклад, при тестах во Framer),
+        # ми БІЛЬШЕ НЕ ВИДАЄМО 404, а просто спускаємо користувача на безпечні ліміти гостя!
 
-            if user.usage_count >= 30:
-                raise HTTPException(status_code=429, detail="LIMIT_EXCEEDED: Лимит тарифа Starter исчерпан.")
-        return user.plan, user
-
+    # Логіка для гостя (анонімна сесія за IP)
     guest = db.query(models.GuestSession).filter(models.GuestSession.session_id == client_ip).first()
     if not guest:
         guest = models.GuestSession(session_id=client_ip, usage_count=0)
@@ -96,7 +99,7 @@ def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[st
 
     return "anonymous", guest
 
-# --- ЖЕЛЕЗОБЕТОННЫЕ ЭНДПОИНТЫ ДЛЯ ФРОНТЕНДА ---
+# --- ЕНДПОЇНТИ ДЛЯ ФРОНТЕНДУ ---
 
 @app.post("/api/remove-bg")
 @app.post("/api/remove-bg/")
