@@ -1,120 +1,253 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Header
-from fastapi.responses import Response
-from sqlalchemy.orm import Session
-from database import get_db
-from models import User, GuestSession
-from auth import get_current_user, check_and_increment_user_limit, GUEST_LIMIT
-from PIL import Image
+import os
 import io
-import uuid
+import zipfile
+import datetime
+import requests
+from typing import List, Optional
+from fastapi import APIRouter, UploadFile, File, Form, Header, HTTPException, Depends, Request, Response
+from sqlalchemy.orm import Session
+from PIL import Image
 
-# ИМПОРТИРУЕМ: Добавили new_session для переключения ИИ-моделей
-from rembg import remove, new_session 
+# Импортируем сессию базы данных и модели из корня проекта
+from database import SessionLocal
+import models
+import replicate
 
 router = APIRouter()
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ALLOWED_TYPES = {"image/jpeg", "image/jpg", "image/png"}
+# Зависимость для безопасного подключения к базе данных
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# --- Инициализация ИИ-модели высокого качества ---
-# "isnet-general-use" — выдает шикарное качество и работает быстро.
-ai_session = new_session("isnet-general-use")
+
+def apply_background_color(image_bytes: bytes, hex_color: str) -> bytes:
+    """Вспомогательная функция: подкладывает сплошной цвет под вырезанный PNG"""
+    try:
+        foreground = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        background = Image.new("RGBA", foreground.size, hex_color)
+        combined = Image.alpha_composite(background, foreground)
+        
+        output = io.BytesIO()
+        combined.convert("RGB").save(output, format="JPEG", quality=95)
+        return output.getvalue()
+    except Exception:
+        return image_bytes
 
 
-# 🔥 Двойной декоратор: теперь бэкенд поймет оба варианта пути от Framer
-@router.post("/remove-bg")
-@router.post("/remove-background")
-async def remove_background(
-    file: UploadFile = File(...),  # Строго совпадает с именем "file" во Framer
-    x_session_id: str | None = Header(default=None),  # для гостей
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_current_user),
-):
-    # --- Валидация файла ---
-    if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(status_code=400, detail="Только JPG, JPEG или PNG")
+def apply_custom_background(foreground_bytes: bytes, background_bytes: bytes) -> bytes:
+    """Вспомогательная функция: берет кастомное фото пользователя и ставит его на фон"""
+    try:
+        foreground = Image.open(io.BytesIO(foreground_bytes)).convert("RGBA")
+        background = Image.open(io.BytesIO(background_bytes)).convert("RGBA")
+        
+        # Умное масштабирование: подгоняем размер фонового фото под размер вырезанного объекта
+        background = background.resize(foreground.size, Image.Resampling.LANCZOS)
+        
+        # Склеиваем слои: фон снизу, объект сверху
+        combined = Image.alpha_composite(background, foreground)
+        
+        output = io.BytesIO()
+        combined.convert("RGB").save(output, format="JPEG", quality=95)
+        return output.getvalue()
+    except Exception:
+        return foreground_bytes
 
-    contents = await file.read()
-    if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="Файл больше 10 МБ")
 
-    # --- Лимиты ---
-    if current_user:
-        # Авторизованный пользователь
-        check_and_increment_user_limit(current_user, db)
-    else:
-        # Гость — по session_id
-        if not x_session_id:
-            x_session_id = str(uuid.uuid4())  # клиент должен хранить и передавать его
+def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[str]) -> tuple[str, any]:
+    """
+    Проверяет лимиты согласно тарифной сетке gServices:
+    - Аноним: 5 в день
+    - Starter: 30 в месяц
+    - Pro / Studio: Безлимит
+    """
+    today = datetime.date.today()
 
-        guest = db.query(GuestSession).filter(
-            GuestSession.session_id == x_session_id
-        ).first()
+    if auth_email:
+        user = db.query(models.User).filter(models.User.email == auth_email, models.User.is_active == True).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        
+        if user.plan == "starter":
+            if user.usage_reset and (datetime.datetime.now() - user.usage_reset).days >= 30:
+                user.usage_count = 0
+                user.usage_reset = datetime.datetime.now()
+                db.commit()
 
-        if not guest:
-            guest = GuestSession(session_id=x_session_id, usage_count=0)
-            db.add(guest)
-            db.commit()
-            db.refresh(guest)
+            if user.usage_count >= 30:
+                raise HTTPException(
+                    status_code=429, 
+                    detail="LIMIT_EXCEEDED: Вы израсходовали лимит 30 фото для Starter-тарифа."
+                )
+        return user.plan, user
 
-        if guest.usage_count >= GUEST_LIMIT:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Бесплатный лимит ({GUEST_LIMIT} попыток) исчерпан. Зарегистрируйтесь бесплатно!"
-            )
+    guest = db.query(models.GuestSession).filter(models.GuestSession.session_id == client_ip).first()
+    if not guest:
+        guest = models.GuestSession(session_id=client_ip, usage_count=0)
+        db.add(guest)
+        db.commit()
+        db.refresh(guest)
 
-        guest.usage_count += 1
+    if guest.created_at and guest.created_at.date() != today:
+        guest.usage_count = 0
+        guest.created_at = datetime.datetime.now()
         db.commit()
 
-    # --- Удаление фона с помощью продвинутой модели ---
-    try:
-        input_image = Image.open(io.BytesIO(contents))
-        
-        # Передаем нашу качественную сессию ai_session в функцию remove
-        output_image = remove(input_image, session=ai_session)
+    if guest.usage_count >= 5:
+        raise HTTPException(
+            status_code=429, 
+            detail="LIMIT_EXCEEDED: 5 бесплатных ежедневных попыток исчерпаны."
+        )
 
-        output_buffer = io.BytesIO()
-        output_image.save(output_buffer, format="PNG")
-        output_buffer.seek(0)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
-
-    remaining = None
-    if not current_user:
-        guest_refreshed = db.query(GuestSession).filter(
-            GuestSession.session_id == x_session_id
-        ).first()
-        remaining = GUEST_LIMIT - (guest_refreshed.usage_count if guest_refreshed else 0)
-
-    headers = {}
-    if remaining is not None:
-        headers["X-Remaining-Uses"] = str(remaining)
-    if not current_user:
-        headers["X-Session-Id"] = x_session_id
-
-    return Response(
-        content=output_buffer.read(),
-        media_type="image/png",
-        headers=headers,
-    )
+    return "anonymous", guest
 
 
-@router.get("/guest-status")
-def guest_status(
-    x_session_id: str | None = Header(default=None),
-    db: Session = Depends(get_db),
+@router.post("/remove-bg")
+async def remove_background(
+    request: Request,
+    file: UploadFile = File(...),                               # Основное фото (вырезаемый объект)
+    background_color: Optional[str] = Form(None),               # Вариант 1: Сплошной цвет заливки
+    background_file: UploadFile = File(None),                   # Вариант 2: Кастомный фон
+    x_user_email: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
 ):
-    """Проверить сколько бесплатных попыток осталось у гостя."""
-    if not x_session_id:
-        return {"remaining": GUEST_LIMIT, "session_id": None}
+    """
+    1. ОДИНОЧНОЕ УДАЛЕНИЕ ФОНА + ЗАМЕНА НА ЦВЕТ ИЛИ КАСТОМНОЕ ФОТО
+    """
+    client_ip = request.client.host
+    plan, db_record = check_and_update_limits(db, client_ip, x_user_email)
 
-    guest = db.query(GuestSession).filter(
-        GuestSession.session_id == x_session_id
-    ).first()
+    try:
+        file_bytes = await file.read()
+        
+        try:
+            model = replicate.models.get("briaai/rmbg-1.5")
+            target_version = model.versions.list()[0]
+        except Exception:
+            model = replicate.models.get("cjwbw/rembg")
+            target_version = model.versions.list()[0]
 
-    used = guest.usage_count if guest else 0
-    return {
-        "remaining": max(0, GUEST_LIMIT - used),
-        "used": used,
-        "limit": GUEST_LIMIT,
-    }
+        output = replicate.run(
+            target_version,
+            input={"image": io.BytesIO(file_bytes)}
+        )
+        
+        img_data = requests.get(output).content
+        
+        if background_file:
+            bg_bytes = await background_file.read()
+            img_data = apply_custom_background(img_data, bg_bytes)
+            media_type = "image/jpeg"
+        elif background_color:
+            img_data = apply_background_color(img_data, background_color)
+            media_type = "image/jpeg"
+        else:
+            media_type = "image/png"
+
+        db_record.usage_count += 1
+        db.commit()
+
+        # Используем прямой Response для четкой отдачи байт браузеру
+        return Response(content=img_data, media_type=media_type)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка нейросети: {str(e)}")
+
+
+@router.post("/enhance-image")
+async def enhance_image(
+    request: Request,
+    file: UploadFile = File(...),
+    x_user_email: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    2. ИИ-УЛУЧШЕНИЕ КАЧЕСТВА ПРЕМИУМ-УРОВНЯ (CodeFormer HD)
+    """
+    client_ip = request.client.host
+    plan, _ = check_and_update_limits(db, client_ip, x_user_email)
+
+    # ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ТЕСТОВ
+    # if plan not in ["pro", "studio"]:
+    #     raise HTTPException(status_code=403, detail="ACCESS_DENIED")
+
+    try:
+        file_bytes = await file.read()
+        
+        try:
+            model = replicate.models.get("sczhou/codeformer")
+            target_version = model.versions.list()[0]
+        except Exception:
+            target_version = "7de2ac439e34d6d99cd94ef191509c07b8b7d345f6624a02701c5b00224b13a2"
+        
+        output = replicate.run(
+            target_version,
+            input={
+                "image": io.BytesIO(file_bytes),
+                "codeformer_fidelity": 0.7,
+                "background_enhance": True,
+                "face_upsample": True,
+                "upscale": 2
+            }
+        )
+        
+        img_data = requests.get(output).content
+        return Response(content=img_data, media_type="image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка премиум-апскейла: {str(e)}")
+
+
+@router.post("/batch-remove-bg")
+async def batch_remove_background(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    x_user_email: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    3. ПАКЕТНАЯ ОБРАБОТКА ФОТО (ZIP-архив)
+    """
+    client_ip = request.client.host
+    plan, db_record = check_and_update_limits(db, client_ip, x_user_email)
+
+    # ВРЕМЕННО ОТКЛЮЧЕНО ДЛЯ ТЕСТОВ
+    # if plan != "studio":
+    #     raise HTTPException(status_code=403, detail="ACCESS_DENIED")
+
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Максимум 10 файлов за раз.")
+
+    zip_buffer = io.BytesIO()
+    
+    try:
+        model = replicate.models.get("briaai/rmbg-1.5")
+        target_version = model.versions.list()[0]
+    except Exception:
+        model = replicate.models.get("cjwbw/rembg")
+        target_version = model.versions.list()[0]
+
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        for index, file in enumerate(files):
+            try:
+                file_bytes = await file.read()
+                output = replicate.run(
+                    target_version,
+                    input={"image": io.BytesIO(file_bytes)}
+                )
+                img_data = requests.get(output).content
+                zip_file.writestr(f"g_remover_{index + 1}.png", img_data)
+                db_record.usage_count += 1
+            except Exception:
+                continue
+
+    db.commit()
+    
+    # Возвращаем полноценный Response с зафиксированными хедерами скачивания архива
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=g_remover_batch.zip"}
+    )
