@@ -8,12 +8,14 @@ from fastapi import APIRouter, UploadFile, File, Form, Header, HTTPException, De
 from sqlalchemy.orm import Session
 from PIL import Image
 
+# Импортируем сессию базы данных и модели из корня проекта
 from database import SessionLocal
 import models
 import replicate
 
 router = APIRouter()
 
+# Зависимость для безопасного подключения к базе данных
 def get_db():
     db = SessionLocal()
     try:
@@ -21,30 +23,47 @@ def get_db():
     finally:
         db.close()
 
+
 def apply_background_color(image_bytes: bytes, hex_color: str) -> bytes:
+    """Вспомогательная функция: подкладывает сплошной цвет под вырезанный PNG"""
     try:
         foreground = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
         background = Image.new("RGBA", foreground.size, hex_color)
         combined = Image.alpha_composite(background, foreground)
+        
         output = io.BytesIO()
         combined.convert("RGB").save(output, format="JPEG", quality=95)
         return output.getvalue()
     except Exception:
         return image_bytes
 
+
 def apply_custom_background(foreground_bytes: bytes, background_bytes: bytes) -> bytes:
+    """Вспомогательная функция: берет кастомное фото пользователя и ставит его на фон"""
     try:
         foreground = Image.open(io.BytesIO(foreground_bytes)).convert("RGBA")
         background = Image.open(io.BytesIO(background_bytes)).convert("RGBA")
+        
+        # Умное масштабирование: подгоняем размер фонового фото под размер вырезанного объекта
         background = background.resize(foreground.size, Image.Resampling.LANCZOS)
+        
+        # Склеиваем слои: фон снизу, объект сверху
         combined = Image.alpha_composite(background, foreground)
+        
         output = io.BytesIO()
         combined.convert("RGB").save(output, format="JPEG", quality=95)
         return output.getvalue()
     except Exception:
         return foreground_bytes
 
+
 def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[str]) -> tuple[str, any]:
+    """
+    Проверяет лимиты согласно тарифной сетке gServices:
+    - Аноним: 5 в день
+    - Starter: 30 в месяц
+    - Pro / Studio: Безлимит
+    """
     today = datetime.date.today()
 
     if auth_email:
@@ -86,19 +105,24 @@ def check_and_update_limits(db: Session, client_ip: str, auth_email: Optional[st
     return "anonymous", guest
 
 
+# 🔥 Двойной декоратор: обрабатывает и /api/remove-bg, и /api/remove-bg/ напрямую без редиректов
 @router.post("/remove-bg")
+@router.post("/remove-bg/")
 async def remove_background(
     request: Request,
-    file: UploadFile = File(...),
-    background_color: Optional[str] = Form(None),
-    background_file: UploadFile = File(None),
-    x_user_email: Optional[str] = Header(None),
-    email: Optional[str] = Form(None),                           # ИСПРАВЛЕНО: Теперь строго ждем из FormData
+    file: UploadFile = File(...),                               # Основное фото (вырезаемый объект)
+    background_color: Optional[str] = Form(None),               # Вариант 1: Сплошной цвет заливки
+    background_file: UploadFile = File(None),                   # Вариант 2: Кастомный фон
+    x_user_email: Optional[str] = Header(None),                 # Поиск в хэдерах для внешних интеграций
+    email: Optional[str] = Form(None),                           # Поиск в FormData для Framer
     db: Session = Depends(get_db)
 ):
+    """
+    1. ОДИНОЧНОЕ УДАЛЕНИЕ ФОНА + ЗАМЕНА НА ЦВЕТ ИЛИ КАСТОМНОЕ ФОТО
+    """
     client_ip = request.client.host
     
-    # Извлекаем email либо из хэдера, либо из формы
+    # Склеиваем источники получения почты пользователя
     final_email = x_user_email or email
     
     plan, db_record = check_and_update_limits(db, client_ip, final_email)
@@ -138,4 +162,95 @@ async def remove_background(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка нейросети: {str(e)}")
 
-# ... (остальные эндпоинты оставляем как есть)
+
+@router.post("/enhance-image")
+@router.post("/enhance-image/")
+async def enhance_image(
+    request: Request,
+    file: UploadFile = File(...),
+    x_user_email: Optional[str] = Header(None),
+    email: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
+    """
+    2. ИИ-УЛУЧШЕНИЕ КАЧЕСТВА ПРЕМИУМ-УРОВНЯ (CodeFormer HD)
+    """
+    client_ip = request.client.host
+    final_email = x_user_email or email
+    plan, _ = check_and_update_limits(db, client_ip, final_email)
+
+    try:
+        file_bytes = await file.read()
+        
+        try:
+            model = replicate.models.get("sczhou/codeformer")
+            target_version = model.versions.list()[0]
+        except Exception:
+            target_version = "7de2ac439e34d6d99cd94ef191509c07b8b7d345f6624a02701c5b00224b13a2"
+        
+        output = replicate.run(
+            target_version,
+            input={
+                "image": io.BytesIO(file_bytes),
+                "codeformer_fidelity": 0.7,
+                "background_enhance": True,
+                "face_upsample": True,
+                "upscale": 2
+            }
+        )
+        
+        img_data = requests.get(output).content
+        return Response(content=img_data, media_type="image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка премиум-апскейла: {str(e)}")
+
+
+@router.post("/batch-remove-bg")
+@router.post("/batch-remove-bg/")
+async def batch_remove_background(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    x_user_email: Optional[str] = Header(None),
+    email: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
+    """
+    3. ПАКЕТНАЯ ОБРАБОТКА ФОТО (ZIP-архив)
+    """
+    client_ip = request.client.host
+    final_email = x_user_email or email
+    plan, db_record = check_and_update_limits(db, client_ip, final_email)
+
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Максимум 10 файлов за раз.")
+
+    zip_buffer = io.BytesIO()
+    
+    try:
+        model = replicate.models.get("briaai/rmbg-1.5")
+        target_version = model.versions.list()[0]
+    except Exception:
+        model = replicate.models.get("cjwbw/rembg")
+        target_version = model.versions.list()[0]
+
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        for index, file in enumerate(files):
+            try:
+                file_bytes = await file.read()
+                output = replicate.run(
+                    target_version,
+                    input={"image": io.BytesIO(file_bytes)}
+                )
+                img_data = requests.get(output).content
+                zip_file.writestr(f"g_remover_{index + 1}.png", img_data)
+                db_record.usage_count += 1
+            except Exception:
+                continue
+
+    db.commit()
+    
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=g_remover_batch.zip"}
+    )
